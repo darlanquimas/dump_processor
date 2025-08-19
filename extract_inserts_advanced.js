@@ -1,8 +1,11 @@
 #!/usr/bin/env node
 
 const fs = require('fs');
-const path = require('path');
 
+/**
+ * Classe para extrair dados de dumps PostgreSQL e gerar scripts de inserção
+ * com tratamento robusto de tipos de dados e sequences
+ */
 class AdvancedDumpExtractor {
     constructor(dumpFile) {
         this.dumpFile = dumpFile;
@@ -14,6 +17,10 @@ class AdvancedDumpExtractor {
         this.errors = [];
     }
 
+    /**
+     * Processa o arquivo de dump e extrai informações das tabelas
+     * @returns {Object} Dados extraídos das tabelas
+     */
     async processDump() {
         console.log('Processando arquivo de dump...');
         
@@ -25,9 +32,8 @@ class AdvancedDumpExtractor {
             let inCopyData = false;
             
             for (let i = 0; i < lines.length; i++) {
-                const line = lines[i].replace(/\r$/, ''); // Remover \r se existir
+                const line = lines[i].replace(/\r$/, '');
                 
-                // Verificar se é início de COPY
                 const copyMatch = line.match(/^COPY ([^"]+"[^"]+") \(([^)]+)\) FROM stdin;?$/);
                 if (copyMatch) {
                     console.log(`Encontrado COPY: ${copyMatch[1]}`);
@@ -40,7 +46,6 @@ class AdvancedDumpExtractor {
                     continue;
                 }
                 
-                // Verificar se é fim de COPY
                 if (line === '\\\.' && inCopyData && currentCopy) {
                     console.log(`Finalizando COPY: ${currentCopy.table}`);
                     this.data.copies.push({
@@ -53,7 +58,6 @@ class AdvancedDumpExtractor {
                     continue;
                 }
                 
-                // Se estamos dentro dos dados COPY
                 if (inCopyData && currentCopy) {
                     currentCopy.data.push(line);
                 }
@@ -61,7 +65,6 @@ class AdvancedDumpExtractor {
 
             console.log(`Encontradas ${this.data.copies.length} tabelas com dados`);
             
-            // Debug: mostrar algumas tabelas encontradas
             if (this.data.copies.length > 0) {
                 console.log('Tabelas encontradas:');
                 this.data.copies.slice(0, 5).forEach((copy, i) => {
@@ -77,6 +80,10 @@ class AdvancedDumpExtractor {
         return this.data;
     }
 
+    /**
+     * Gera script SQL para inserção de dados com tratamento de sequences
+     * @returns {string} Script SQL completo
+     */
     generateInsertScript() {
         const script = [];
         
@@ -86,22 +93,7 @@ class AdvancedDumpExtractor {
         script.push('-- Versão: Advanced');
         script.push('');
         
-        // Desabilitar triggers
-        script.push('-- Desabilitar triggers para evitar problemas com foreign keys');
-        script.push('DO $$');
-        script.push('DECLARE');
-        script.push('r RECORD;');
-        script.push('BEGIN');
-        script.push('FOR r IN');
-        script.push('SELECT conname, conrelid::regclass::text AS table_name');
-        script.push('FROM pg_constraint');
-        script.push('WHERE contype = \'f\'');
-        script.push('LOOP');
-        script.push('EXECUTE format(\'ALTER TABLE %s DISABLE TRIGGER ALL\', r.table_name);');
-        script.push('END LOOP;');
-        script.push('END $$;');
-        script.push('');
-        
+        this.addTriggerManagement(script, false);
         script.push('-- Inserir dados');
         
         for (const copySection of this.data.copies) {
@@ -137,42 +129,9 @@ class AdvancedDumpExtractor {
             script.push('');
         }
         
-        // Reabilitar triggers
-        script.push('-- Reabilitar triggers');
-        script.push('DO $$');
-        script.push('DECLARE');
-        script.push('r RECORD;');
-        script.push('BEGIN');
-        script.push('FOR r IN');
-        script.push('SELECT conname, conrelid::regclass::text AS table_name');
-        script.push('FROM pg_constraint');
-        script.push('WHERE contype = \'f\'');
-        script.push('LOOP');
-        script.push('EXECUTE format(\'ALTER TABLE %s ENABLE TRIGGER ALL\', r.table_name);');
-        script.push('END LOOP;');
-        script.push('END $$;');
-        script.push('');
+        this.addTriggerManagement(script, true);
+        this.addSequenceAdjustment(script);
         
-        // Ajustar sequences - versão mais robusta
-        script.push('-- Ajustar sequences das chaves primárias');
-        for (const copySection of this.data.copies) {
-            const { table: tableName, columns } = copySection;
-            const columnList = columns.split(',').map(col => col.trim());
-            
-            // Procurar por colunas que parecem ser IDs
-            const idColumns = columnList.filter(col => 
-                col.toLowerCase().includes('id') || 
-                col.toLowerCase().includes('_id')
-            );
-            
-            for (const idCol of idColumns) {
-                script.push(`-- Ajustar sequence para ${tableName}.${idCol}`);
-                script.push(`SELECT setval(pg_get_serial_sequence('${tableName}', '${idCol}'), COALESCE((SELECT MAX(${idCol}) FROM ${tableName}), 1));`);
-                script.push('');
-            }
-        }
-        
-        // Adicionar resumo
         if (this.errors.length > 0) {
             script.push('-- AVISOS:');
             script.push('-- Os seguintes erros foram encontrados durante o processamento:');
@@ -185,8 +144,79 @@ class AdvancedDumpExtractor {
         return script.join('\n');
     }
 
+    /**
+     * Adiciona comandos para gerenciar triggers (desabilitar/reabilitar)
+     * @param {Array} script - Array do script SQL
+     * @param {boolean} enable - Se deve habilitar (true) ou desabilitar (false) triggers
+     */
+    addTriggerManagement(script, enable) {
+        const action = enable ? 'ENABLE' : 'DISABLE';
+        script.push(`-- ${enable ? 'Reabilitar' : 'Desabilitar'} triggers para evitar problemas com foreign keys`);
+        script.push('DO $$');
+        script.push('DECLARE');
+        script.push('r RECORD;');
+        script.push('BEGIN');
+        script.push('FOR r IN');
+        script.push('SELECT conname, conrelid::regclass::text AS table_name');
+        script.push('FROM pg_constraint');
+        script.push('WHERE contype = \'f\'');
+        script.push('LOOP');
+        script.push(`EXECUTE format('ALTER TABLE %s ${action} TRIGGER ALL', r.table_name);`);
+        script.push('END LOOP;');
+        script.push('END $$;');
+        script.push('');
+    }
+
+    /**
+     * Adiciona comandos para ajustar sequences das chaves primárias
+     * @param {Array} script - Array do script SQL
+     */
+    addSequenceAdjustment(script) {
+        script.push('-- Ajustar sequences das chaves primárias');
+        for (const copySection of this.data.copies) {
+            const { table: tableName, columns } = copySection;
+            const columnList = columns.split(',').map(col => col.trim());
+            
+            const idColumns = columnList.filter(col => 
+                col.toLowerCase().includes('id') || 
+                col.toLowerCase().includes('_id')
+            );
+            
+            for (const idCol of idColumns) {
+                script.push(`-- Ajustar sequence para ${tableName}.${idCol}`);
+                script.push(`DO $$`);
+                script.push(`DECLARE`);
+                script.push(`    seq_name text;`);
+                script.push(`    max_val bigint;`);
+                script.push(`    col_exists boolean;`);
+                script.push(`BEGIN`);
+                script.push(`    -- Verificar se a coluna existe na tabela`);
+                script.push(`    SELECT EXISTS(`);
+                script.push(`        SELECT 1 FROM information_schema.columns`);
+                script.push(`        WHERE table_schema = split_part('${tableName}', '.', 1)`);
+                script.push(`        AND table_name = split_part('${tableName}', '.', 2)`);
+                script.push(`        AND column_name = '${idCol.replace(/"/g, '')}'`);
+                script.push(`    ) INTO col_exists;`);
+                script.push(`    `);
+                script.push(`    IF col_exists THEN`);
+                script.push(`        seq_name := pg_get_serial_sequence('${tableName}', '${idCol.replace(/"/g, '')}');`);
+                script.push(`        IF seq_name IS NOT NULL THEN`);
+                script.push(`            EXECUTE format('SELECT COALESCE(MAX(%I), 1) FROM ${tableName}', '${idCol.replace(/"/g, '')}') INTO max_val;`);
+                script.push(`            EXECUTE format('SELECT setval(%L, %s)', seq_name, max_val);`);
+                script.push(`        END IF;`);
+                script.push(`    END IF;`);
+                script.push(`END $$;`);
+                script.push('');
+            }
+        }
+    }
+
+    /**
+     * Parse linha do COPY (tab separado) com tratamento robusto de caracteres especiais
+     * @param {string} line - Linha de dados do COPY
+     * @returns {Array} Array de valores parseados
+     */
     parseCopyLine(line) {
-        // Parse linha do COPY (tab separado) - versão mais robusta
         const values = [];
         let current = '';
         let inQuotes = false;
@@ -228,42 +258,46 @@ class AdvancedDumpExtractor {
         return values;
     }
 
+    /**
+     * Formata valor para inserção SQL com tratamento de tipos específicos
+     * @param {string} value - Valor a ser formatado
+     * @returns {string} Valor formatado para SQL
+     */
     formatValueAdvanced(value) {
         if (value === '\\N' || value === '') {
             return 'NULL';
         }
         
-        // Se for número (inteiro ou decimal)
         if (/^-?\d+(\.\d+)?$/.test(value)) {
             return value;
         }
         
-        // Se for boolean
         if (value === 't' || value === 'f') {
             return `'${value}'`;
         }
         
-        // Se parece ser JSON
         if ((value.startsWith('{') && value.endsWith('}')) || 
             (value.startsWith('[') && value.endsWith(']'))) {
             const escaped = value.replace(/'/g, "''");
             return `'${escaped}'`;
         }
         
-        // Se parece ser timestamp
         if (/^\d{4}-\d{2}-\d{2}/.test(value) && value.includes(':')) {
             const escaped = value.replace(/'/g, "''");
             return `'${escaped}'`;
         }
         
-        // String - escapar aspas simples e caracteres especiais
         const escaped = value
             .replace(/'/g, "''")
-            .replace(/\0/g, ''); // Remover caracteres nulos
+            .replace(/\0/g, '');
         
         return `'${escaped}'`;
     }
 
+    /**
+     * Salva o script SQL gerado em arquivo
+     * @param {string} outputFile - Caminho do arquivo de saída
+     */
     async saveScript(outputFile) {
         const script = this.generateInsertScript();
         fs.writeFileSync(outputFile, script, 'utf8');
@@ -275,6 +309,9 @@ class AdvancedDumpExtractor {
     }
 }
 
+/**
+ * Função principal para execução do script
+ */
 async function main() {
     const args = process.argv.slice(2);
     
